@@ -1,0 +1,36 @@
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://shop:shop@postgres:5432/shop
+      ENABLE_PERIODIC_EVALS: "true"
+      EVAL_INTERVAL_SECONDS: "86400"
+    depends_on: [redis, postgres]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  frontend:
+    image: nginx:1.27-alpine
+    ports: ["8080:80"]
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    depends_on: [api]
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: shop
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+    volumes: [pgdata:/var/lib/postgresql/data]
+    restart: unless-stopped
+volumes:
+  pgdata:
