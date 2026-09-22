@@ -17,6 +17,60 @@ HIGH_RISK_THRESHOLD = 70
 MIN_EVIDENCE_CONFIDENCE = 0.75
 
 
+def _evidence_consistency(case: dict) -> dict:
+    """本地证据适配器：把申请声明、订单商品和附件 OCR 文本放进同一判定。"""
+    files = case.get("evidence_files") or []
+    order = next((item for item in store.orders if item["id"] == case.get("order_id")), None)
+    item_names = [item.get("name", "") for item in (order or {}).get("items", [])]
+    reason = str(case.get("reason", ""))
+    declared = " ".join([reason, str(case.get("service_type", "")), " ".join(item_names), str(case.get("evidence_description") or "")]).lower()
+    issue_terms = ("退货", "退款", "换货", "质量", "破损", "损坏", "少件", "漏发", "无声", "断连", "物流", "包装")
+    expected_terms = [term for term in issue_terms if term in declared]
+    product_terms = [name for name in item_names if len(name) >= 2]
+
+    if not files:
+        return {"status": "missing", "matched": False, "confidence": 0.0, "reason": "未上传附件，无法核验申请内容与证据的一致性", "checked_files": 0, "matched_files": 0}
+
+    results = []
+    for artifact in files:
+        ocr_text = str(artifact.get("ocr_text") or "").strip().lower()
+        if not ocr_text:
+            results.append({"artifact_id": artifact.get("id"), "status": "unverified", "reason": "附件尚未获得 OCR 文本，不能仅凭文件名认定内容一致"})
+            continue
+        issue_hits = [term for term in expected_terms if term in ocr_text]
+        product_hits = [term for term in product_terms if term.lower() in ocr_text]
+        order_hit = str(case.get("order_id", "")).lower() in ocr_text
+        specific_issue_hits = [term for term in issue_hits if term != "包装"]
+        matched = bool(product_hits or specific_issue_hits) and (not product_terms or bool(product_hits or order_hit))
+        results.append({
+            "artifact_id": artifact.get("id"),
+            "status": "matched" if matched else "mismatch",
+            "reason": "附件文本与申请原因/订单商品存在可解释匹配" if matched else "附件文本未能匹配申请原因或订单商品",
+            "issue_hits": issue_hits,
+            "specific_issue_hits": specific_issue_hits,
+            "product_hits": product_hits,
+            "order_id_matched": order_hit,
+        })
+
+    matched_files = [item for item in results if item["status"] == "matched"]
+    mismatch_files = [item for item in results if item["status"] == "mismatch"]
+    if mismatch_files:
+        status, reason = "mismatch", "附件内容与退货申请或订单商品不一致，需要人工核验"
+    elif matched_files:
+        status, reason = "matched", "附件内容与退货申请及订单上下文一致"
+    else:
+        status, reason = "unverified", "附件已上传但尚未完成 OCR，暂不能确认一致性"
+    return {
+        "status": status,
+        "matched": status == "matched",
+        "confidence": round(len(matched_files) / max(1, len(results)), 2),
+        "reason": reason,
+        "checked_files": len(results),
+        "matched_files": len(matched_files),
+        "details": results,
+    }
+
+
 def classify(text: str) -> tuple[str, float]:
     """兼容旧接口，实际由统一双层意图路由器完成。"""
     result = classify_intent(text)
@@ -27,12 +81,14 @@ def _evidence_agent(case: dict) -> dict:
     confidence = float(case.get("evidence_confidence", 0.95))
     reason = case.get("reason", "")
     evidence_type = "image_ocr" if any(word in reason for word in ("图片", "照片", "凭证", "截图")) else "buyer_statement"
+    consistency = _evidence_consistency(case)
     return {
         "agent": "EvidenceOCRAgent",
         "confidence": confidence,
         "evidence_type": evidence_type,
         "quality": "sufficient" if confidence >= MIN_EVIDENCE_CONFIDENCE else "insufficient",
         "production_adapter": "OCRProvider" if evidence_type == "image_ocr" else None,
+        "consistency": consistency,
     }
 
 
@@ -148,6 +204,8 @@ def run_after_sales(case: dict) -> dict:
         fraud = fraud_future.result()
         sentiment = sentiment_future.result()
     node("ParallelAnalysis", "completed", {"evidence": evidence, "fraud": fraud, "sentiment": sentiment}, parallel_started)
+    consistency = evidence["consistency"]
+    node("EvidenceConsistency", "completed" if consistency["status"] == "matched" else "blocked", consistency, perf_counter())
 
     retrieval_started = perf_counter()
     retrieval = search_with_diagnostics(security.text + " 售后政策 退货退款", role="agent")
@@ -157,7 +215,11 @@ def run_after_sales(case: dict) -> dict:
     risk_score = fraud["risk_score"]
     confidence = evidence["confidence"]
     policy_started = perf_counter()
-    if confidence < MIN_EVIDENCE_CONFIDENCE:
+    if consistency["status"] == "mismatch":
+        status, outcome, decision, reason = "SUSPENDED_HUMAN", "PENDING", "EVIDENCE_MISMATCH_REVIEW", consistency["reason"]
+    elif case.get("evidence_required") and consistency["status"] != "matched":
+        status, outcome, decision, reason = "SUSPENDED_HUMAN", "PENDING", "EVIDENCE_VERIFICATION_REQUIRED", consistency["reason"]
+    elif confidence < MIN_EVIDENCE_CONFIDENCE:
         status, outcome, decision, reason = "SUSPENDED_HUMAN", "PENDING", "REQUEST_MORE_EVIDENCE", "凭证识别置信度低于 0.75，需要补充或人工核验"
     elif risk_score >= HIGH_RISK_THRESHOLD:
         status, outcome, decision, reason = "SUSPENDED_HUMAN", "PENDING", "FRAUD_REVIEW_REQUIRED", "风险评分达到人工复核阈值"
@@ -190,6 +252,7 @@ def run_after_sales(case: dict) -> dict:
         "amount": amount,
         "risk_score": risk_score,
         "evidence": evidence,
+        "evidence_consistency": consistency,
         "sentiment": sentiment,
         "intent": asdict(intent),
         "references": [item["source"] for item in retrieval["items"]],

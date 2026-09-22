@@ -41,15 +41,51 @@ def _extract_office(content: bytes, extension: str) -> str:
         _validate_archive(archive)
         if extension == ".docx":
             names = ["word/document.xml"]
+            chunks = []
+            for name in names:
+                try:
+                    chunks.append(_xml_text(archive.read(name)))
+                except (KeyError, ElementTree.ParseError):
+                    continue
+            return "\n".join(chunks)
         else:
-            names = [name for name in archive.namelist() if name == "xl/sharedStrings.xml" or name.startswith("xl/worksheets/sheet")]
-        chunks = []
-        for name in names[:30]:
+            namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            shared_strings = []
             try:
-                chunks.append(_xml_text(archive.read(name)))
+                root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+                for item in root.findall("x:si", namespace):
+                    shared_strings.append("".join(item.itertext()).strip())
             except (KeyError, ElementTree.ParseError):
-                continue
-        return "\n".join(chunks)
+                pass
+
+            rows = []
+            names = sorted(name for name in archive.namelist() if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"))
+            for name in names[:30]:
+                try:
+                    root = ElementTree.fromstring(archive.read(name))
+                except (KeyError, ElementTree.ParseError):
+                    continue
+                for row in root.findall(".//x:sheetData/x:row", namespace):
+                    values = []
+                    for cell in row.findall("x:c", namespace):
+                        cell_type = cell.attrib.get("t")
+                        value_node = cell.find("x:v", namespace)
+                        inline_node = cell.find("x:is", namespace)
+                        value = ""
+                        if cell_type == "inlineStr" and inline_node is not None:
+                            value = "".join(inline_node.itertext()).strip()
+                        elif value_node is not None and value_node.text is not None:
+                            value = value_node.text.strip()
+                            if cell_type == "s":
+                                try:
+                                    value = shared_strings[int(value)]
+                                except (ValueError, IndexError):
+                                    value = ""
+                        if value:
+                            values.append(value)
+                    if values:
+                        rows.append(" | ".join(values))
+            return "\n".join(rows)
 
 
 def inspect_document(filename: str, content: bytes) -> dict:

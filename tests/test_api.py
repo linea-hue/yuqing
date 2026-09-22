@@ -1,9 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.sandbox import inspect_document
 
 client = TestClient(app)
 manager_token = client.post("/api/auth/login", json={"username": "manager", "password": "manager123"}).json()["token"]
@@ -212,6 +216,45 @@ def test_sandbox_upload_trace_and_duplicate_pages_removed():
         assert not (frontend / legacy).exists()
 
 
+def test_did_video_adapter_uses_basic_auth_and_polls_result(monkeypatch):
+    import json
+    from app import digital_human
+
+    monkeypatch.setenv("DIGITAL_HUMAN_PROVIDER", "did")
+    monkeypatch.setenv("DID_API_KEY", "user:password")
+    monkeypatch.setenv("DID_SOURCE_URL", "https://example.com/presenter.png")
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = json.dumps(payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return self.payload
+
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        calls.append(request)
+        if request.full_url.endswith("/talks"):
+            return FakeResponse({"id": "tlk_test", "status": "created"})
+        return FakeResponse({"id": "tlk_test", "status": "done", "result_url": "https://example.com/video.mp4"})
+
+    with patch.object(digital_human, "urlopen", side_effect=fake_urlopen):
+        created = digital_human.render_video("欢迎了解这款商品。", {"id": "p1001", "name": "测试商品"})
+        status = digital_human.video_status("tlk_test")
+
+    assert created["provider"] == "did"
+    assert created["video_id"] == "tlk_test"
+    assert status["video_url"].endswith(".mp4")
+    assert calls[0].headers["Authorization"] == "Basic dXNlcjpwYXNzd29yZA=="
+
+
 def _clear_cart():
     for row in client.get("/api/cart").json()["items"]:
         client.delete(f"/api/cart/{row['line_id']}")
@@ -293,3 +336,108 @@ def test_return_refund_requires_reverse_logistics_receipt_before_approval():
     approved = client.post(f"/api/after-sales/{case['id']}/decision", headers={**MANAGER, "X-Idempotency-Key": "return-approved"}, json={"action": "approve", "comment": "仓库验收通过"})
     assert approved.status_code == 200
     assert approved.json()["outcome"] == "APPROVED"
+
+
+def test_evidence_consistency_is_visible_and_blocks_mismatch():
+    payload = {
+        "order_id": "o20260901001",
+        "amount": 1,
+        "reason": "\u5546\u54c1\u5916\u5305\u88c5\u7834\u635f",
+        "evidence_filename": "damage.jpg",
+        "evidence_description": "\u8ba2\u5355 o20260901001 \u7684\u8f7b\u91cf\u901a\u52e4\u53cc\u80a9\u5305\u5916\u5305\u88c5\u7834\u635f\u7167\u7247",
+    }
+    case = client.post("/api/after-sales", json=payload).json()
+    assert case["decision"] == "EVIDENCE_VERIFICATION_REQUIRED"
+    upload = client.post(
+        f"/api/after-sales/{case['id']}/evidence",
+        files={"file": ("damage.jpg", b"demo-image", "image/jpeg")},
+        data={"evidence_text": payload["evidence_description"]},
+    )
+    assert upload.status_code == 200
+    assert upload.json()["consistency"]["status"] == "matched"
+
+    mismatch_payload = {**payload, "evidence_description": "\u8ba2\u5355 o20260901001 \u7684\u8033\u673a\u5305\u88c5\u7167\u7247"}
+    mismatch = client.post("/api/after-sales", json=mismatch_payload).json()
+    bad = client.post(
+        f"/api/after-sales/{mismatch['id']}/evidence",
+        files={"file": ("other.jpg", b"demo-image-2", "image/jpeg")},
+        data={"evidence_text": mismatch_payload["evidence_description"]},
+    )
+    assert bad.status_code == 200
+    assert bad.json()["consistency"]["status"] == "mismatch"
+    assert client.get(f"/api/after-sales/{mismatch['id']}").json()["decision"] == "EVIDENCE_MISMATCH_REVIEW"
+
+
+def test_evidence_without_ocr_text_is_unverified():
+    case = client.post(
+        "/api/after-sales",
+        json={
+            "order_id": "o20260901001",
+            "amount": 1,
+            "reason": "\u5546\u54c1\u5916\u5305\u88c5\u7834\u635f",
+            "evidence_filename": "damage.jpg",
+        },
+    ).json()
+    upload = client.post(
+        f"/api/after-sales/{case['id']}/evidence",
+        files={"file": ("damage.jpg", b"demo-image-3", "image/jpeg")},
+    )
+    assert upload.json()["consistency"]["status"] == "unverified"
+
+
+def test_sandbox_extracts_xlsx_shared_strings_and_rows():
+    workbook = BytesIO()
+    with ZipFile(workbook, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            '<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>订单号</t></si><si><t>售后原因</t></si><si><t>o20260901001</t></si><si><t>外包装破损</t></si></sst>',
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row><row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2" t="s"><v>3</v></c></row></sheetData></worksheet>',
+        )
+    parsed = inspect_document("returns.xlsx", workbook.getvalue())
+    assert "订单号 | 售后原因" in parsed["text"]
+    assert "o20260901001 | 外包装破损" in parsed["text"]
+
+
+def test_batch_approval_import_processes_xlsx_rows():
+    case = client.post(
+        "/api/after-sales",
+        json={"order_id": "o20260901001", "amount": 1, "reason": "\u5546\u54c1\u8d28\u91cf\u95ee\u9898", "evidence_confidence": 0.5},
+    ).json()
+    workbook = BytesIO()
+    with ZipFile(workbook, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            f'<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>ticket_no</t></si><si><t>order_id</t></si><si><t>amount</t></si><si><t>risk_score</t></si><si><t>approval_action</t></si><si><t>comment</t></si><si><t>{case["id"]}</t></si><si><t>o20260901001</t></si><si><t>1</t></si><si><t>12</t></si><si><t>approve</t></si><si><t>Excel approval passed</t></si></sst>',
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1">' +
+            "".join(f'<c r="{column}1" t="s"><v>{index}</v></c>' for column, index in zip("ABCDEF", range(6))) +
+            '</row><row r="2">' +
+            "".join(f'<c r="{column}2" t="s"><v>{index}</v></c>' for column, index in zip("ABCDEF", range(6, 12))) +
+            '</row></sheetData></worksheet>',
+        )
+    response = client.post(
+        "/api/ops/batch/import",
+        headers=MANAGER,
+        files={"file": ("suspended.xlsx", workbook.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert response.status_code == 200
+    assert response.json()["approved"] == 1
+    assert response.json()["failed"] == 0
+    assert client.get(f"/api/after-sales/{case['id']}").json()["outcome"] == "APPROVED"
+
+
+def test_batch_demo_xlsx_export_contains_approve_action():
+    client.post(
+        "/api/after-sales",
+        json={"order_id": "o20260901001", "amount": 1, "reason": "\u8865\u5145\u4eba\u5de5\u5ba1\u6279\u6d4b\u8bd5", "evidence_confidence": 0.5},
+    )
+    response = client.get("/api/ops/batch/export-test-xlsx", headers=MANAGER)
+    assert response.status_code == 200
+    parsed = inspect_document("demo.xlsx", response.content)
+    assert "approval_action | comment" in parsed["text"]
+    assert "approve | 演示审批通过" in parsed["text"]

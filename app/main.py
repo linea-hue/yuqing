@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import zipfile
 from contextlib import asynccontextmanager
+from html import escape as xml_escape
 from pathlib import Path
 from secrets import token_urlsafe
 from time import time
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +36,10 @@ from .commerce import (
     update_cart_line,
 )
 from .decision import review_after_sales, run_after_sales
+from .digital_human import answer_question as digital_human_answer
+from .digital_human import product_script, provider_configured as digital_human_provider_configured
+from .digital_human import recommend as digital_human_recommend, speak as digital_human_speak
+from .digital_human import video_status as digital_human_video_status
 from .evaluation import golden_dataset, run_offline_eval, telemetry_snapshot
 from .infrastructure import workflow_infra
 from .intent import classify_intent, intent_metrics as build_intent_metrics
@@ -125,7 +132,9 @@ class AfterSalesCreate(BaseModel):
     amount: float = Field(gt=0)
     reason: str = Field(min_length=2, max_length=1000)
     evidence_confidence: float = Field(default=0.95, ge=0, le=1)
-    service_type: str = Field(default="仅退款", pattern="^(仅退款|退货退款|换货)$")
+    service_type: str = Field(default="\u4ec5\u9000\u6b3e", pattern="^(\u4ec5\u9000\u6b3e|\u9000\u8d27\u9000\u6b3e|\u6362\u8d27)$")
+    evidence_filename: str | None = Field(default=None, max_length=255)
+    evidence_description: str | None = Field(default=None, max_length=1000)
 
 
 class DecisionRequest(BaseModel):
@@ -139,6 +148,10 @@ class EscalateRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
+
+
+class DigitalHumanAskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
 
 
 class CheckoutRequest(BaseModel):
@@ -232,6 +245,13 @@ def commerce_call(func, *args, **kwargs):
         raise HTTPException(exc.status_code, exc.detail) from exc
 
 
+def get_product_or_404(product_id: str) -> dict:
+    product = next((x for x in store.products if x["id"] == product_id), None)
+    if not product:
+        raise HTTPException(404, "商品不存在")
+    return product
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "ecommerce-agent-platform", "time": now(), "workflow_infrastructure": workflow_infra.status()["mode"]}
@@ -249,13 +269,26 @@ def login_page():
 
 @app.get("/buyer")
 def buyer_app():
-    return FileResponse(Path(__file__).parent.parent / "frontend" / "buyer_final.html")
+    page = (Path(__file__).parent.parent / "frontend" / "buyer_final.html").read_text(encoding="utf-8")
+    page = page.replace("</body>", '<script src="/after_sales_consistency.js"></script></body>')
+    from fastapi.responses import HTMLResponse
+
+    return HTMLResponse(page)
 
 
 @app.get("/ops")
 def ops_app():
     # 统一入口到带登录、评测、安全与 Telemetry 的企业运营控制台。
-    return FileResponse(Path(__file__).parent.parent / "frontend" / "ops_console.html")
+    page = (Path(__file__).parent.parent / "frontend" / "ops_console.html").read_text(encoding="utf-8")
+    page = page.replace("</body>", '<script src="/after_sales_consistency.js"></script></body>')
+    from fastapi.responses import HTMLResponse
+
+    return HTMLResponse(page)
+
+
+@app.get("/after_sales_consistency.js")
+def after_sales_consistency_script():
+    return FileResponse(Path(__file__).parent.parent / "frontend" / "after_sales_consistency.js", media_type="application/javascript")
 
 
 @app.get("/cs")
@@ -556,7 +589,15 @@ def create_after_sales(req: AfterSalesCreate, x_idempotency_key: str | None = He
         if remembered:
             return {"idempotent": True, **remembered}
     case_id = "as-" + uuid4().hex[:10]
-    case = {"id": case_id, "buyer_id": "buyer-demo", **req.model_dump(), "status": "RUNNING", "state_history": [{"state": "RUNNING", "at": now(), "reason": "accepted"}], "created_at": now()}
+    case = {
+        "id": case_id,
+        "buyer_id": "buyer-demo",
+        **req.model_dump(),
+        "evidence_required": bool(req.evidence_filename or req.evidence_description),
+        "status": "RUNNING",
+        "state_history": [{"state": "RUNNING", "at": now(), "reason": "accepted"}],
+        "created_at": now(),
+    }
     result = run_after_sales(case)
     case.update(result)
     store.after_sales[case_id] = case
@@ -584,7 +625,11 @@ def get_after_sales(case_id: str):
 
 
 @app.post("/api/after-sales/{case_id}/evidence")
-async def upload_after_sales_evidence(case_id: str, file: UploadFile = File(...)):
+async def upload_after_sales_evidence(
+    case_id: str,
+    file: UploadFile = File(...),
+    evidence_text: str | None = Form(default=None, max_length=2000),
+):
     """上传售后凭证元数据；真实 OCR 通过 provider 适配器替换。"""
     case = store.after_sales.get(case_id)
     if not case:
@@ -597,11 +642,46 @@ async def upload_after_sales_evidence(case_id: str, file: UploadFile = File(...)
     if not content or len(content) > 8 * 1024 * 1024:
         raise HTTPException(422, "凭证为空或超过 8MB")
     digest = hashlib.sha256(content).hexdigest()
-    artifact = {"id": "ev-" + digest[:12], "filename": filename, "content_type": file.content_type, "bytes": len(content), "sha256": digest, "ocr_status": "queued", "ocr_provider": "OCRProvider", "created_at": now()}
+    artifact = {
+        "id": "ev-" + digest[:12],
+        "filename": filename,
+        "content_type": file.content_type,
+        "bytes": len(content),
+        "sha256": digest,
+        "ocr_status": "completed" if evidence_text else "queued",
+        "ocr_provider": "local_text_adapter" if evidence_text else "OCRProvider",
+        "ocr_text": evidence_text or "",
+        "created_at": now(),
+    }
     case.setdefault("evidence_files", []).append(artifact)
-    # 本地适配器只负责可信元数据登记，不伪装 OCR 内容；运营可继续调整置信度并人工复核。
-    store.add_event({"node": "EvidenceUpload", "status": "queued", "case_id": case_id, "artifact_id": artifact["id"], "bytes": len(content), "trace_id": case.get("trace_id")})
-    return {"case_id": case_id, "artifact": artifact, "next_action": "ocr_worker_or_human_review"}
+    from .decision import _evidence_consistency
+
+    consistency = _evidence_consistency(case)
+    case["evidence_consistency"] = consistency
+    store.add_event({
+        "node": "EvidenceConsistency",
+        "status": "completed" if consistency["status"] == "matched" else "blocked",
+        "case_id": case_id,
+        "artifact_id": artifact["id"],
+        "output": consistency,
+        "trace_id": case.get("trace_id"),
+    })
+    if consistency["status"] == "mismatch":
+        case.update({
+            "status": "SUSPENDED_HUMAN",
+            "outcome": "PENDING",
+            "decision": "EVIDENCE_MISMATCH_REVIEW",
+            "decision_reason": consistency["reason"],
+        })
+    elif consistency["status"] == "matched" and case.get("decision") == "EVIDENCE_VERIFICATION_REQUIRED":
+        refreshed = run_after_sales(case)
+        case.update(refreshed)
+    return {
+        "case_id": case_id,
+        "artifact": artifact,
+        "consistency": consistency,
+        "next_action": "continue_decision" if consistency["status"] == "matched" else "human_review",
+    }
 
 
 @app.post("/api/after-sales/{case_id}/return-shipment")
@@ -672,6 +752,46 @@ def chat(req: ChatRequest):
     if intent.intent == "物流查询":
         answer = "请在‘我的订单’查看实时物流；如物流停滞超过 72 小时，我们可以为你登记催件。"
     return {"blocked": False, "intent": intent.intent, "confidence": intent.confidence, "intent_method": intent.method, "answer": answer, "references": grounded["references"], "grounded": grounded["grounded"], "next_action": "answer" if grounded["grounded"] or intent.intent == "物流查询" else "human_review", "trace_id": trace_id}
+
+
+@app.get("/api/digital-human/products/{product_id}")
+def digital_human_product(product_id: str):
+    product = get_product_or_404(product_id)
+    script = product_script(product)
+    recommendations = digital_human_recommend("", product)
+    return {
+        "product": product,
+        "script": script,
+        "provider": "configured" if digital_human_provider_configured() else "browser_fallback",
+        "recommendations": recommendations,
+        "capabilities": ["商品讲解", "规格问答", "相似商品推荐", "浏览器语音播报"],
+    }
+
+
+@app.post("/api/digital-human/products/{product_id}/speak")
+def digital_human_speak_product(product_id: str):
+    product = get_product_or_404(product_id)
+    return digital_human_speak(product_script(product), product)
+
+
+@app.post("/api/digital-human/products/{product_id}/video")
+def digital_human_video_product(product_id: str):
+    product = get_product_or_404(product_id)
+    return digital_human_speak(product_script(product), product)
+
+
+@app.get("/api/digital-human/videos/{video_id}")
+def digital_human_video(video_id: str):
+    return digital_human_video_status(video_id)
+
+
+@app.post("/api/digital-human/products/{product_id}/ask")
+def digital_human_ask_product(product_id: str, req: DigitalHumanAskRequest):
+    product = get_product_or_404(product_id)
+    result = digital_human_answer(req.question, product)
+    result["recommendations"] = digital_human_recommend(req.question, product)
+    result["product_id"] = product_id
+    return result
 
 
 @app.post("/api/voice/turn")
@@ -791,7 +911,16 @@ def knowledge_documents(status: str | None = None):
     rows = list(store.knowledge)
     if status:
         rows = [x for x in rows if x.get("status", "published") == status]
-    return {"items": [{k: x.get(k) for k in ("id", "title", "type", "version", "status", "shop_id", "effective_at", "keywords")} for x in rows], "total": len(rows)}
+    return {
+        "items": [
+            {
+                **{k: x.get(k) for k in ("id", "title", "type", "version", "status", "shop_id", "effective_at", "keywords")},
+                "preview": str(x.get("text", ""))[:500],
+            }
+            for x in rows
+        ],
+        "total": len(rows),
+    }
 
 
 @app.get("/api/knowledge/gaps")
@@ -811,7 +940,14 @@ async def upload_knowledge(file: UploadFile = File(...), authorization: str | No
     doc = {"id": "kb-" + uuid4().hex[:8], "title": inspected["filename"], "type": "运营上传", "version": "draft", "status": "draft", "text": inspected["text"], "shop_id": "all", "acl": ["agent", "manager", "admin"], "keywords": [], "sandbox": inspected["sandbox"], "bytes": inspected["bytes"]}
     store.knowledge.append(doc)
     store.add_event({"node": "DocumentSandbox", "status": "completed", "document_id": doc["id"], "bytes": inspected["bytes"], "trace_id": str(uuid4())})
-    return {"status": "draft", "document": {k: doc[k] for k in ("id", "title", "type", "version", "sandbox")}}
+    return {
+        "status": "draft",
+        "document": {
+            **{k: doc[k] for k in ("id", "title", "type", "version", "sandbox")},
+            "preview": doc["text"][:1000],
+            "bytes": doc["bytes"],
+        },
+    }
 
 
 @app.get("/api/ops/dashboard")
@@ -1052,6 +1188,129 @@ def batch_export(authorization: str | None = Header(default=None)):
         writer.writerow([x["id"], x["order_id"], x["amount"], x.get("risk_score", 0), "", ""])
     from fastapi.responses import Response
     return Response(output.getvalue().encode("utf-8-sig"), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=suspended.csv"})
+
+
+def _xlsx_response(rows: list[list], filename: str):
+    def cell_ref(row_idx: int, col_idx: int) -> str:
+        letters = ""
+        col = col_idx
+        while col:
+            col, rem = divmod(col - 1, 26)
+            letters = chr(65 + rem) + letters
+        return f"{letters}{row_idx}"
+
+    sheet_rows = []
+    for row_idx, row in enumerate(rows, start=1):
+        cells = []
+        for col_idx, value in enumerate(row, start=1):
+            text = xml_escape(str(value if value is not None else ""))
+            cells.append(f'<c r="{cell_ref(row_idx, col_idx)}" t="inlineStr"><is><t>{text}</t></is></c>')
+        sheet_rows.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
+    sheet_xml = f'<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{"".join(sheet_rows)}</sheetData></worksheet>'
+    workbook_xml = '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="审批结果" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    content_types = '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
+    root_rels = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+    workbook_rels = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook_xml)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    from fastapi.responses import Response
+
+    return Response(buffer.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+@app.get("/api/ops/batch/export-test-xlsx")
+def batch_export_test_xlsx(authorization: str | None = Header(default=None)):
+    authorize(authorization, "MANAGER", "ADMIN")
+    rows = [["ticket_no", "order_id", "amount", "risk_score", "approval_action", "comment"]]
+    for case in store.after_sales.values():
+        if case.get("status") == "SUSPENDED_HUMAN":
+            rows.append([case["id"], case["order_id"], case["amount"], case.get("risk_score", 0), "approve", "演示审批通过"])
+    return _xlsx_response(rows, "suspended-approve-demo.xlsx")
+
+
+@app.post("/api/ops/batch/import")
+async def batch_import(file: UploadFile = File(...), authorization: str | None = Header(default=None)):
+    actor = authorize(authorization, "MANAGER", "ADMIN")
+    filename = Path(file.filename or "").name
+    if Path(filename).suffix.lower() not in {".csv", ".xlsx"}:
+        raise HTTPException(422, "批量审批仅支持 CSV 或 XLSX 文件")
+    content = await file.read()
+    try:
+        inspected = inspect_document(filename, content)
+    except SandboxViolation as exc:
+        store.add_event({"node": "BatchApprovalSandbox", "status": "blocked", "filename": filename, "reason": str(exc), "trace_id": str(uuid4())})
+        raise HTTPException(422, str(exc)) from exc
+
+    headers = None
+    rows = []
+    for line in inspected["text"].splitlines():
+        cells = [cell.strip() for cell in line.split(" | ")]
+        if not cells or not any(cells):
+            continue
+        normalized = [cell.lower() for cell in cells]
+        if normalized[0] in {"ticket_no", "工单号"}:
+            headers = normalized
+            continue
+        row = dict(zip(headers or ["ticket_no", "order_id", "amount", "risk_score", "approval_action", "comment"], cells))
+        rows.append(row)
+    if not rows:
+        raise HTTPException(422, "Excel 中未读取到审批数据，请确认包含 ticket_no 和 approval_action 列")
+
+    approved = rejected = failed = skipped = 0
+    details = []
+    for index, row in enumerate(rows, start=2):
+        case_id = str(row.get("ticket_no") or row.get("工单号") or "").strip()
+        action = str(row.get("approval_action") or row.get("审批动作") or "").strip().lower()
+        comment = str(row.get("comment") or row.get("审批意见") or "批量审批").strip() or "批量审批"
+        if not case_id or action not in {"approve", "approved", "reject", "rejected"}:
+            skipped += 1
+            details.append({"row": index, "ticket_no": case_id, "status": "skipped", "reason": "缺少工单号或审批动作不是 approve/reject"})
+            continue
+        try:
+            result = review_after_sales(
+                case_id,
+                action="approve" if action.startswith("approv") else "reject",
+                comment=comment,
+                role=actor["role"],
+                idempotency_key=f"batch:{uuid4().hex}",
+            )
+            if result.get("outcome") == "APPROVED":
+                approved += 1
+                result_status = "approved"
+            else:
+                rejected += 1
+                result_status = "rejected"
+            details.append({"row": index, "ticket_no": case_id, "status": result_status, "decision": result.get("decision")})
+        except Exception as exc:
+            failed += 1
+            details.append({"row": index, "ticket_no": case_id, "status": "failed", "reason": type(exc).__name__})
+
+    store.add_event({
+        "node": "BatchApprovalSandbox",
+        "status": "completed",
+        "filename": filename,
+        "parsed_rows": len(rows),
+        "approved": approved,
+        "rejected": rejected,
+        "failed": failed,
+        "skipped": skipped,
+        "trace_id": str(uuid4()),
+    })
+    return {
+        "filename": filename,
+        "sandbox": inspected["sandbox"],
+        "parsed_rows": len(rows),
+        "approved": approved,
+        "rejected": rejected,
+        "failed": failed,
+        "skipped": skipped,
+        "details": details,
+    }
 
 
 @app.get("/api/ops/evals/golden")

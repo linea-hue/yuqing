@@ -23,6 +23,7 @@
 - 安全：Critic 注入/越狱/角色冒充检测、手机号/身份证/邮箱/银行卡/API Key 脱敏、Tool Policy 与临时 Bearer 令牌。
 - 可观测：每次请求返回 trace_id，动态记录节点时延、Checkpoint、事件流、DLQ 和知识缺口。
 - 语音适配：浏览器 ASR + TTS 播报与打断 + `/api/voice/turn` + `/ws/voice` 统一转写/意图/RAG/安全回合协议。
+- 数字人导购：商品卡与详情页可打开数字人介绍；默认浏览器播报，也支持通过 D-ID 或 HeyGen API 生成真人口型同步商品讲解视频。
 - RAG 深化：口语 Query 改写、混合词法重排、ACL/状态过滤、引用阈值、检索延迟和知识缺口记录。
 - 部署：Docker Compose 配置（Web、Redis、PostgreSQL、前端）。
 
@@ -39,6 +40,25 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 打开 <http://127.0.0.1:18000>。API 文档：<http://127.0.0.1:18000/docs>。
+
+## 接入真人数字人视频
+
+复制 `.env.example` 为 `.env`，填写 D-ID API Key 和公网头像地址：
+
+```powershell
+Copy-Item .env.example .env
+$env:DIGITAL_HUMAN_PROVIDER = "did"
+$env:DID_API_KEY = "你的 D-ID API Key"
+$env:DID_SOURCE_URL = "https://你的公网域名/digital-human-presenter.png"
+```
+
+导购弹窗里的真人视频入口调用 `/api/digital-human/products/{product_id}/video`，返回 D-ID 视频任务 ID；前端再通过 `/api/digital-human/videos/{video_id}` 查询状态。D-ID 的头像地址必须是公网 HTTPS 地址，不能使用电脑本地路径或 `127.0.0.1`。
+
+## 接入真人实时直播
+
+买家端现在提供“真人直播”入口。打开 `/buyer` 后，点击首页或顶部导航的“真人直播”，再点击“开启摄像头”，浏览器会请求摄像头和麦克风权限；授权后即可真人出镜、切换摄像头、关闭麦克风，并把商品详情带入直播间。
+
+当前实现是本机摄像头预览和直播间交互演示，“开始直播”的画面不会自动发送给其他观众。要做真正的多人在线直播，需要在前端摄像头流与服务端之间接入 WebRTC 信令/媒体服务器，或将视频转成 RTMP 推送到云直播，再由观众端使用 WebRTC、FLV 或 HLS 播放。正式上线时还应补充主播登录、推流鉴权、断线重连、录制、审核和观众互动。
 
 ## Docker 启动
 
